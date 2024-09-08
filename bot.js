@@ -5,6 +5,7 @@ const { ethers } = require('ethers');
 const DeSatsImgABI = require('./lib/abis/DeSatsImg.json');
 const constant = require('./constant.js');
 const SatelliteInfo = require('./models/satelliteInfo');
+const CrowdfundingSatelliteABI = require('./lib/abis/CrowdfundingSatellite.json');
 
 let redisClient;
 
@@ -12,12 +13,24 @@ const provider = new ethers.providers.JsonRpcProvider(
   constant.CHAINS.GALADRIEL_TESTNET.RPC_URL
 );
 
+const chillizProvider = new ethers.providers.JsonRpcProvider(
+  constant.CHAINS.CHILLIZ_TESTNET.RPC_URL
+);
+
 const wallet = new ethers.Wallet(process.env.KEY, provider);
+
+const chillizWallet = new ethers.Wallet(process.env.KEY, chillizProvider);
 
 const deSatsImgContract = new ethers.Contract(
   constant.CHAINS.GALADRIEL_TESTNET.TOKEN_ADDRESSES.DeSatsImg,
   DeSatsImgABI,
   wallet
+);
+
+const crowdfundingContract = new ethers.Contract(
+  constant.CHAINS.CHILLIZ_TESTNET.TOKEN_ADDRESSES.CrowdfundingSatellite,
+  CrowdfundingSatelliteABI,
+  chillizWallet
 );
 
 const inMemoryCacheStep = new Map();
@@ -50,7 +63,6 @@ async function handleMessage(context) {
     inMemoryCacheStep.delete(sender.address);
     userData.delete(sender.address);
     await redisClient.del(sender.address);
-    await SatelliteInfo.deleteOne({ address: sender.address });
     await context.send(
       "Your progress has been reset. You can start over whenever you're ready."
     );
@@ -112,9 +124,7 @@ async function handleMessage(context) {
       if (urlRegex.test(text)) {
         user.whitepaperLink = text;
         userData.set(sender.address, user);
-        await context.send(
-          'Apply for Crowdfunding? (Please answer YES or NO)'
-        );
+        await context.send('Apply for Crowdfunding? (Please answer YES or NO)');
         inMemoryCacheStep.set(sender.address, 5);
       } else {
         await context.send(
@@ -127,13 +137,34 @@ async function handleMessage(context) {
       if (['yes', 'no'].includes(text.toLowerCase())) {
         user.isCrowdfunding = text.toLowerCase() === 'yes';
         userData.set(sender.address, user);
-        await context.send('Enter Mission Launch Date in format: DD-MM-YYYY');
-        inMemoryCacheStep.set(sender.address, 6);
+        if (user.isCrowdfunding) {
+          await context.send(
+            'Enter the duration of the crowdfunding campaign in days:'
+          );
+          inMemoryCacheStep.set(sender.address, 6);
+        } else {
+          await context.send('Enter Mission Launch Date in format: DD-MM-YYYY');
+          inMemoryCacheStep.set(sender.address, 7);
+        }
       } else {
         await context.send('Please answer YES or NO.');
       }
       break;
     case 6: {
+      const duration = Number.parseInt(text, 10);
+      if (!Number.isNaN(duration) && duration > 0) {
+        user.crowdfundingDuration = duration * 24 * 60 * 60; // Convert days to seconds
+        userData.set(sender.address, user);
+        await context.send('Enter Mission Launch Date in format: DD-MM-YYYY');
+        inMemoryCacheStep.set(sender.address, 7);
+      } else {
+        await context.send(
+          'Invalid duration. Please enter a valid number of days.'
+        );
+      }
+      break;
+    }
+    case 7: {
       const dateRegex = /^(\d{2})-(\d{2})-(\d{4})$/;
       if (dateRegex.test(text)) {
         const [, day, month, year] = text.match(dateRegex);
@@ -141,17 +172,21 @@ async function handleMessage(context) {
         if (!Number.isNaN(date.getTime())) {
           user.missionLaunchDate = date;
           userData.set(sender.address, user);
-          await context.send('Description of the Satellite for the image generation:');
-          inMemoryCacheStep.set(sender.address, 7);
+          await context.send(
+            'Description of the Satellite for the image generation:'
+          );
+          inMemoryCacheStep.set(sender.address, 8);
         } else {
-          await context.send('Invalid date. Please enter a valid date in the format DD-MM-YYYY.');
+          await context.send(
+            'Invalid date. Please enter a valid date in the format DD-MM-YYYY.'
+          );
         }
       } else {
         await context.send('Invalid date format. Please use DD-MM-YYYY.');
       }
       break;
     }
-    case 7:
+    case 8:
       user.satelliteDescription = text;
       userData.set(sender.address, user);
 
@@ -166,6 +201,7 @@ async function handleMessage(context) {
           isCrowdfunding: user.isCrowdfunding,
           missionLaunchDate: user.missionLaunchDate,
           satelliteDescription: user.satelliteDescription,
+          crowdfundingDuration: user.crowdfundingDuration,
         });
         await satelliteInfo.save();
       } catch (error) {
@@ -174,45 +210,80 @@ async function handleMessage(context) {
 
       // Call Galadriel smart contract to initialize image generation
       try {
-        const tx = await deSatsImgContract.initializeImageGeneration(user.satelliteDescription);
+        const tx = await deSatsImgContract.initializeImageGeneration(
+          user.satelliteDescription
+        );
         const receipt = await tx.wait();
 
-        const event = receipt.events.find(e => e.event === 'ImageInputCreated');
+        const event = receipt.events.find(
+          (e) => e.event === 'ImageInputCreated'
+        );
         const tokenId = event.args.tokenId.toString();
+        user.tokenId = tokenId;
 
         // Update the tokenId in MongoDB
-        await SatelliteInfo.findOneAndUpdate(
+        SatelliteInfo.findOneAndUpdate(
           { address: sender.address },
-          { tokenId: tokenId, txHash: tx.hash },
-        );
+          { tokenId: tokenId, txHash: tx.hash }
+        ).then(() => {});
 
         await context.send(
           `Thank you for providing the information. Your image generation has been initialized with token ID ${tokenId}. Please wait for the image to be generated.`
         );
 
         // Set up an event listener for the ImageGenerated event
-        deSatsImgContract.once('ImageGenerated', async (generatedTokenId, imageUrl) => {
-          if (generatedTokenId.toString() === tokenId) {
-            try {
-              // Update the imageUrl in MongoDB
-              await SatelliteInfo.findOneAndUpdate(
-                { tokenId: tokenId, txHash: tx.hash },
-                { imageUrl: imageUrl },
-              );
-
-              await context.send("Your satellite image has been generated:");
-              await context.send(imageUrl);
-            } catch (error) {
-              console.error('Error updating image URL in MongoDB:', error);
+        deSatsImgContract.once(
+          'ImageGenerated',
+          async (generatedTokenId, imageUrl) => {
+            if (generatedTokenId.toString() === tokenId) {
+              try {
+                // Update the imageUrl in MongoDB
+                await SatelliteInfo.findOneAndUpdate(
+                  { tokenId: tokenId, txHash: tx.hash },
+                  { imageUrl: imageUrl }
+                );
+                await context.send('Your satellite image has been generated:');
+                await context.send(imageUrl);
+              } catch (error) {
+                console.error('Error updating image URL in MongoDB:', error);
+              }
             }
           }
-        });
-
+        );
       } catch (error) {
         console.error('Error initializing satellite image generation:', error);
         await context.send(
           'There was an error initializing the satellite image generation. Please try again later.'
         );
+      }
+
+      // Create crowdfunding campaign if user indicated they want to apply for crowdfunding
+      if (user.isCrowdfunding) {
+        try {
+          const goal = ethers.utils.parseEther('100'); // Set an appropriate goal
+          const duration = user.crowdfundingDuration; // Use the duration provided by the user
+          const tokenAddress =
+            constant.CHAINS.CHILLIZ_TESTNET.TOKEN_ADDRESSES.SATFAN; // Use appropriate token address
+
+          const tx = await crowdfundingContract.createCampaign(
+            Number(user.tokenId),
+            sender.address, // Use the sender's address as the creator
+            goal,
+            duration,
+            tokenAddress
+          );
+          const receipt = await tx.wait();
+          console.log(receipt);
+          await context.send(
+            `A crowdfunding campaign has been created for your satellite project with token ID ${user.tokenId}. View the transaction on the explorer: https://testnet.chiliscan.com/tx/${receipt.transactionHash}`
+          );
+        } catch (error) {
+          a;
+          console.error('Error creating crowdfunding campaign:', error);
+          await context.send(
+            'There was an error creating the crowdfunding campaign. Please try again later.'
+          );
+        }
       }
 
       inMemoryCacheStep.delete(sender.address);

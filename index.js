@@ -11,7 +11,7 @@ const port = process.env.PORT || 3000;
 const corsOptions = {
   origin: '*',
   methods: ['GET', 'POST', 'PUT'],
-  allowedHeaders: ['Content-Type', 'x-access-token', 'X-client', 'X-server'],
+  allowedHeaders: ['*'],
   maxAge: 86400,
 };
 app.use(cors(corsOptions));
@@ -23,10 +23,13 @@ connectDB();
 // Routes
 const nftRoutes = require('./routes/nft');
 const imageRoutes = require('./routes/image');
-const satelliteRoutes = require('./routes/satellite'); // Add this line
+const satelliteRoutes = require('./routes/satellite');
+const crowdfundingRoutes = require('./routes/crowdfunding'); // Add this line
+
 app.use('/api/nft', nftRoutes);
 app.use('/api/image', imageRoutes);
-app.use('/api/satellite', satelliteRoutes); // Add this line
+app.use('/api/satellite', satelliteRoutes);
+app.use('/api/crowdfunding', crowdfundingRoutes); // Add this line
 
 app.get('/', (req, res) => {
   res.send('Welcome to DeSats API');
