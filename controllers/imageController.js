@@ -26,7 +26,7 @@ exports.initializeImageGeneration = async (req, res) => {
 
     const tx = await deSatsImgContract.initializeImageGeneration(prompt);
     const receipt = await tx.wait();
-
+    console.log("Reciept", JSON.stringify(receipt))
     const event = receipt.events.find(e => e.event === 'ImageInputCreated');
     const tokenId = event.args.tokenId.toString();
 
